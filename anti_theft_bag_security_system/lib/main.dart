@@ -1,4 +1,9 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
 
 void main() {
   runApp(const SmartBagApp());
@@ -32,8 +37,16 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
+  final FlutterBluetoothSerial bluetooth =
+      FlutterBluetoothSerial.instance;
+
+  BluetoothConnection? connection;
+  StreamSubscription<Uint8List>? inputSubscription;
+
   bool isArmed = false;
   bool bluetoothConnected = false;
+  bool isConnecting = false;
+
   int battery = 86;
   String motionStatus = 'Normal';
   double sensitivity = 50;
@@ -43,53 +56,415 @@ class _DashboardScreenState extends State<DashboardScreen> {
     'Bluetooth disconnected',
   ];
 
-  void connectBluetooth() {
-    setState(() {
-      bluetoothConnected = !bluetoothConnected;
+  @override
+  void dispose() {
+    inputSubscription?.cancel();
+    connection?.finish();
+    super.dispose();
+  }
 
-      if (bluetoothConnected) {
-        events.insert(0, 'Bluetooth connected');
-      } else {
-        events.insert(0, 'Bluetooth disconnected');
+  // ------------------------------------------------------------
+  // BLUETOOTH CONNECTION
+  // ------------------------------------------------------------
+
+  Future<void> connectBluetooth() async {
+    if (isConnecting) return;
+
+    if (bluetoothConnected) {
+      await disconnectBluetooth();
+      return;
+    }
+
+    setState(() {
+      isConnecting = true;
+    });
+
+    try {
+      final bool? enabled = await bluetooth.isEnabled;
+
+      if (enabled != true) {
+        final bool? turnedOn = await bluetooth.requestEnable();
+
+        if (turnedOn != true) {
+          _addEvent('Bluetooth is turned off');
+
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Please turn on Bluetooth first.'),
+              ),
+            );
+          }
+
+          setState(() {
+            isConnecting = false;
+          });
+
+          return;
+        }
+      }
+
+      final List<BluetoothDevice> devices =
+          await bluetooth.getBondedDevices();
+
+      BluetoothDevice? bagDevice;
+
+      for (final device in devices) {
+        if (device.name == 'AntiTheftBag') {
+          bagDevice = device;
+          break;
+        }
+      }
+
+      if (bagDevice == null) {
+        _addEvent('AntiTheftBag not paired');
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Pair your phone with AntiTheftBag first.',
+              ),
+            ),
+          );
+        }
+
+        setState(() {
+          isConnecting = false;
+        });
+
+        return;
+      }
+
+      _addEvent('Connecting to AntiTheftBag');
+
+      final newConnection =
+          await BluetoothConnection.toAddress(bagDevice.address);
+
+      connection = newConnection;
+
+      setState(() {
+        bluetoothConnected = true;
+        isConnecting = false;
+      });
+
+      _addEvent('Bluetooth connected');
+
+      // Listen for messages coming from ESP32.
+      inputSubscription = connection!.input.listen(
+        (Uint8List data) {
+          final String message = utf8.decode(
+            data,
+            allowMalformed: true,
+          );
+
+          _handleIncomingMessage(message);
+        },
+        onDone: () {
+          _handleConnectionClosed();
+        },
+        onError: (error) {
+          _addEvent('Bluetooth error');
+          _handleConnectionClosed();
+        },
+      );
+
+      // Ask ESP32 for current status.
+      sendCommand('STATUS');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Connected to AntiTheftBag'),
+          ),
+        );
+      }
+    } catch (error) {
+      setState(() {
+        bluetoothConnected = false;
+        isConnecting = false;
+      });
+
+      _addEvent('Bluetooth connection failed');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Could not connect to AntiTheftBag: $error',
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> disconnectBluetooth() async {
+    try {
+      await inputSubscription?.cancel();
+      inputSubscription = null;
+
+      await connection?.finish();
+      connection = null;
+
+      setState(() {
+        bluetoothConnected = false;
+      });
+
+      _addEvent('Bluetooth disconnected');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Bluetooth disconnected'),
+          ),
+        );
+      }
+    } catch (error) {
+      setState(() {
+        bluetoothConnected = false;
+      });
+
+      _addEvent('Bluetooth disconnected');
+    }
+  }
+
+  // ------------------------------------------------------------
+  // SEND COMMAND TO ESP32
+  // ------------------------------------------------------------
+
+  void sendCommand(String command) {
+    if (!bluetoothConnected || connection == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Connect to AntiTheftBag first.',
+            ),
+          ),
+        );
+      }
+
+      return;
+    }
+
+    try {
+      final Uint8List data = Uint8List.fromList(
+        utf8.encode('$command\n'),
+      );
+
+      connection!.output.add(data);
+
+      _addEvent('Command sent: $command');
+    } catch (error) {
+      _addEvent('Failed to send command');
+    }
+  }
+
+  // ------------------------------------------------------------
+  // RECEIVE DATA FROM ESP32
+  // ------------------------------------------------------------
+
+  void _handleIncomingMessage(String rawMessage) {
+    final List<String> messages = rawMessage
+        .split(RegExp(r'[\r\n]+'))
+        .map((message) => message.trim())
+        .where((message) => message.isNotEmpty)
+        .toList();
+
+    for (final message in messages) {
+      _processMessage(message);
+    }
+  }
+
+  void _processMessage(String message) {
+    debugPrint('ESP32 -> $message');
+
+    if (message == 'ARMED') {
+      setState(() {
+        isArmed = true;
+      });
+
+      _addEvent('System armed');
+      return;
+    }
+
+    if (message == 'DISARMED') {
+      setState(() {
+        isArmed = false;
+        motionStatus = 'Normal';
+      });
+
+      _addEvent('System disarmed');
+      return;
+    }
+
+    if (message == 'STATUS:ARMED') {
+      setState(() {
+        isArmed = true;
+      });
+
+      _addEvent('Status: Armed');
+      return;
+    }
+
+    if (message == 'STATUS:DISARMED') {
+      setState(() {
+        isArmed = false;
+        motionStatus = 'Normal';
+      });
+
+      _addEvent('Status: Disarmed');
+      return;
+    }
+
+    if (message == 'MOTION') {
+      setState(() {
+        motionStatus = 'Detected';
+      });
+
+      _addEvent('Motion detected');
+      return;
+    }
+
+    if (message == 'ZIP_OPEN') {
+      _addEvent('Zipper opened');
+
+      if (isArmed) {
+        setState(() {
+          motionStatus = 'Alert';
+        });
+      }
+
+      return;
+    }
+
+    if (message == 'ZIP_CLOSED') {
+      setState(() {
+        motionStatus = 'Normal';
+      });
+
+      _addEvent('Zipper closed');
+      return;
+    }
+
+    if (message == 'FIND') {
+      _addEvent('Find My Bag activated');
+      return;
+    }
+
+    if (message == 'WRONG PIN') {
+      _addEvent('Wrong PIN entered');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('ESP32 rejected the PIN.'),
+          ),
+        );
+      }
+
+      return;
+    }
+
+    if (message == 'UNKNOWN COMMAND') {
+      _addEvent('ESP32 received unknown command');
+      return;
+    }
+
+    _addEvent('ESP32: $message');
+  }
+
+  void _handleConnectionClosed() {
+    if (!mounted) return;
+
+    setState(() {
+      bluetoothConnected = false;
+      connection = null;
+    });
+
+    _addEvent('Bluetooth connection lost');
+  }
+
+  // ------------------------------------------------------------
+  // EVENTS
+  // ------------------------------------------------------------
+
+  void _addEvent(String event) {
+    if (!mounted) return;
+
+    setState(() {
+      events.insert(0, event);
+
+      if (events.length > 50) {
+        events.removeLast();
       }
     });
   }
 
+  // ------------------------------------------------------------
+  // ARM / DISARM
+  // ------------------------------------------------------------
+
   void openPinDialog() {
+    if (!bluetoothConnected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Connect to AntiTheftBag before arming or disarming.',
+          ),
+        ),
+      );
+
+      return;
+    }
+
     showDialog(
       context: context,
       builder: (context) => PinDialog(
         title: isArmed ? 'Disarm System' : 'Arm System',
-        onSuccess: () {
-          setState(() {
-            isArmed = !isArmed;
-            events.insert(
-              0,
-              isArmed ? 'System armed' : 'System disarmed',
-            );
-          });
+        onSuccess: (String pin) {
+          if (isArmed) {
+            sendCommand('DISARM:$pin');
+          } else {
+            sendCommand('ARM:$pin');
+          }
         },
       ),
     );
   }
 
-  void findBag() {
-    setState(() {
-      events.insert(0, 'Find My Bag activated');
-    });
+  // ------------------------------------------------------------
+  // FIND MY BAG
+  // ------------------------------------------------------------
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Find My Bag activated'),
-      ),
-    );
+  void findBag() {
+    if (!bluetoothConnected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Connect to AntiTheftBag first.',
+          ),
+        ),
+      );
+
+      return;
+    }
+
+    sendCommand('FIND:1234');
   }
+
+  // ------------------------------------------------------------
+  // NAVIGATION
+  // ------------------------------------------------------------
 
   void showEvents() {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => EventsScreen(events: events),
+        builder: (_) => EventsScreen(
+          events: events,
+        ),
       ),
     );
   }
@@ -110,19 +485,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
+  // ------------------------------------------------------------
+  // UI
+  // ------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
           'Smart Bag Security',
-          style: TextStyle(fontWeight: FontWeight.bold),
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+          ),
         ),
         centerTitle: true,
         actions: [
           IconButton(
             onPressed: showSettings,
-            icon: const Icon(Icons.settings_outlined),
+            icon: const Icon(
+              Icons.settings_outlined,
+            ),
           ),
         ],
       ),
@@ -170,7 +553,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       icon: Icons.directions_run,
                       title: 'Motion',
                       value: motionStatus,
-                      iconColor: Colors.blue,
+                      iconColor: motionStatus == 'Alert'
+                          ? Colors.red
+                          : Colors.blue,
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -188,19 +573,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const SizedBox(height: 24),
 
               ElevatedButton.icon(
-                onPressed: connectBluetooth,
+                onPressed:
+                    isConnecting ? null : connectBluetooth,
                 icon: Icon(
-                  bluetoothConnected
-                      ? Icons.bluetooth_disabled
-                      : Icons.bluetooth,
+                  isConnecting
+                      ? Icons.sync
+                      : bluetoothConnected
+                          ? Icons.bluetooth_disabled
+                          : Icons.bluetooth,
                 ),
                 label: Text(
-                  bluetoothConnected
-                      ? 'Disconnect Bluetooth'
-                      : 'Connect to Bag',
+                  isConnecting
+                      ? 'Connecting...'
+                      : bluetoothConnected
+                          ? 'Disconnect Bluetooth'
+                          : 'Connect to Bag',
                 ),
                 style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 16,
+                  ),
                 ),
               ),
 
@@ -212,10 +604,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   isArmed ? Icons.lock_open : Icons.lock,
                 ),
                 label: Text(
-                  isArmed ? 'DISARM SYSTEM' : 'ARM SYSTEM',
+                  isArmed
+                      ? 'DISARM SYSTEM'
+                      : 'ARM SYSTEM',
                 ),
                 style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 16,
+                  ),
                 ),
               ),
 
@@ -223,10 +619,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
               OutlinedButton.icon(
                 onPressed: findBag,
-                icon: const Icon(Icons.location_searching),
+                icon: const Icon(
+                  Icons.location_searching,
+                ),
                 label: const Text('FIND MY BAG'),
                 style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 16,
+                  ),
                 ),
               ),
 
@@ -273,7 +673,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _statusCard() {
-    final statusColor = isArmed ? Colors.orange : Colors.green;
+    final statusColor =
+        isArmed ? Colors.orange : Colors.green;
 
     return Container(
       padding: const EdgeInsets.all(22),
@@ -291,13 +692,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Column(
         children: [
           Icon(
-            isArmed ? Icons.shield : Icons.shield_outlined,
+            isArmed
+                ? Icons.shield
+                : Icons.shield_outlined,
             size: 64,
             color: statusColor,
           ),
           const SizedBox(height: 10),
           Text(
-            isArmed ? 'SYSTEM ARMED' : 'SYSTEM SAFE',
+            isArmed
+                ? 'SYSTEM ARMED'
+                : 'SYSTEM SAFE',
             style: TextStyle(
               fontSize: 24,
               fontWeight: FontWeight.bold,
@@ -333,7 +738,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
       child: Column(
         children: [
-          Icon(icon, color: iconColor, size: 30),
+          Icon(
+            icon,
+            color: iconColor,
+            size: 30,
+          ),
           const SizedBox(height: 8),
           Text(
             title,
@@ -365,7 +774,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       icon: Icon(icon),
       label: Text(title),
       style: OutlinedButton.styleFrom(
-        padding: const EdgeInsets.symmetric(vertical: 15),
+        padding: const EdgeInsets.symmetric(
+          vertical: 15,
+        ),
       ),
     );
   }
@@ -393,7 +804,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ...recent.map(
             (event) => ListTile(
               contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.notifications_none),
+              leading: const Icon(
+                Icons.notifications_none,
+              ),
               title: Text(event),
               dense: true,
             ),
@@ -404,9 +817,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 }
 
+// ============================================================
+// PIN DIALOG
+// ============================================================
+
 class PinDialog extends StatefulWidget {
   final String title;
-  final VoidCallback onSuccess;
+  final ValueChanged<String> onSuccess;
 
   const PinDialog({
     super.key,
@@ -419,23 +836,30 @@ class PinDialog extends StatefulWidget {
 }
 
 class _PinDialogState extends State<PinDialog> {
-  final TextEditingController controller = TextEditingController();
-
-  // Temporary test PIN.
-  // Later this will be replaced by ESP32 authentication.
-  final String testPin = '1234';
+  final TextEditingController controller =
+      TextEditingController();
 
   String? errorMessage;
 
   void verifyPin() {
-    if (controller.text == testPin) {
-      Navigator.pop(context);
-      widget.onSuccess();
-    } else {
+    final String pin = controller.text.trim();
+
+    if (pin.length != 4) {
       setState(() {
-        errorMessage = 'Incorrect PIN. Please try again.';
+        errorMessage =
+            'Enter your 4-digit security PIN.';
       });
+      return;
     }
+
+    Navigator.pop(context);
+    widget.onSuccess(pin);
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
   }
 
   @override
@@ -445,7 +869,9 @@ class _PinDialogState extends State<PinDialog> {
       content: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Text('Enter your 4-digit security PIN'),
+          const Text(
+            'Enter your 4-digit security PIN',
+          ),
           const SizedBox(height: 16),
           TextField(
             controller: controller,
@@ -477,12 +903,16 @@ class _PinDialogState extends State<PinDialog> {
         ),
         ElevatedButton(
           onPressed: verifyPin,
-          child: const Text('CONFIRM'),
+          child: const Text('SEND'),
         ),
       ],
     );
   }
 }
+
+// ============================================================
+// EVENTS SCREEN
+// ============================================================
 
 class EventsScreen extends StatelessWidget {
   final List<String> events;
@@ -508,9 +938,13 @@ class EventsScreen extends StatelessWidget {
               itemBuilder: (context, index) {
                 return Card(
                   child: ListTile(
-                    leading: const Icon(Icons.event_note),
+                    leading: const Icon(
+                      Icons.event_note,
+                    ),
                     title: Text(events[index]),
-                    subtitle: const Text('Smart Bag Security System'),
+                    subtitle: const Text(
+                      'Smart Bag Security System',
+                    ),
                   ),
                 );
               },
@@ -518,6 +952,10 @@ class EventsScreen extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// SETTINGS SCREEN
+// ============================================================
 
 class SettingsScreen extends StatefulWidget {
   final double sensitivity;
@@ -530,10 +968,12 @@ class SettingsScreen extends StatefulWidget {
   });
 
   @override
-  State<SettingsScreen> createState() => _SettingsScreenState();
+  State<SettingsScreen> createState() =>
+      _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState
+    extends State<SettingsScreen> {
   late double currentSensitivity;
 
   @override
@@ -570,7 +1010,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             min: 0,
             max: 100,
             divisions: 20,
-            label: '${currentSensitivity.round()}%',
+            label:
+                '${currentSensitivity.round()}%',
             onChanged: (value) {
               setState(() {
                 currentSensitivity = value;
@@ -583,17 +1024,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const ListTile(
             leading: Icon(Icons.bluetooth),
             title: Text('Bluetooth'),
-            subtitle: Text('ESP32 connection settings'),
+            subtitle: Text(
+              'ESP32 connection settings',
+            ),
           ),
           const ListTile(
             leading: Icon(Icons.security),
             title: Text('Security PIN'),
-            subtitle: Text('PIN authentication settings'),
+            subtitle: Text(
+              'PIN authentication settings',
+            ),
           ),
           const ListTile(
             leading: Icon(Icons.battery_full),
             title: Text('Battery'),
-            subtitle: Text('Battery monitoring'),
+            subtitle: Text(
+              'Battery monitoring',
+            ),
           ),
         ],
       ),
