@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
+import 'package:flutter_classic_bluetooth/flutter_classic_bluetooth.dart';
 
 void main() {
   runApp(const SmartBagApp());
@@ -37,10 +37,10 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  final FlutterBluetoothSerial bluetooth =
-      FlutterBluetoothSerial.instance;
+  final FlutterClassicBluetooth bluetooth =
+      FlutterClassicBluetooth();
 
-  BluetoothConnection? connection;
+  BtcConnection? connection;
   StreamSubscription<Uint8List>? inputSubscription;
 
   bool isArmed = false;
@@ -80,12 +80,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
 
     try {
-      final bool? enabled = await bluetooth.isEnabled;
+      final bool enabled = await bluetooth.isEnabled();
 
-      if (enabled != true) {
-        final bool? turnedOn = await bluetooth.requestEnable();
+      if (!enabled) {
+        final bool turnedOn = await bluetooth.enableBluetooth();
 
-        if (turnedOn != true) {
+        if (!turnedOn) {
           _addEvent('Bluetooth is turned off');
 
           if (mounted) {
@@ -104,13 +104,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
       }
 
-      final List<BluetoothDevice> devices =
-          await bluetooth.getBondedDevices();
+      final devices = await bluetooth.getPairedDevices();
 
-      BluetoothDevice? bagDevice;
+      dynamic bagDevice;
 
       for (final device in devices) {
-        if (device.name == 'AntiTheftBag') {
+        if (device.displayName == 'AntiTheftBag') {
           bagDevice = device;
           break;
         }
@@ -138,8 +137,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       _addEvent('Connecting to AntiTheftBag');
 
-      final newConnection =
-          await BluetoothConnection.toAddress(bagDevice.address);
+      final newConnection = await bluetooth.connect(
+        address: bagDevice.address,
+      );
 
       connection = newConnection;
 
@@ -150,7 +150,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       _addEvent('Bluetooth connected');
 
-      // Listen for messages coming from ESP32.
       inputSubscription = connection!.input.listen(
         (Uint8List data) {
           final String message = utf8.decode(
@@ -169,7 +168,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
         },
       );
 
-      // Ask ESP32 for current status.
       sendCommand('STATUS');
 
       if (mounted) {
@@ -204,7 +202,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       await inputSubscription?.cancel();
       inputSubscription = null;
 
-      await connection?.finish();
+      await connection?.close();
       connection = null;
 
       setState(() {
@@ -233,7 +231,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   // SEND COMMAND TO ESP32
   // ------------------------------------------------------------
 
-  void sendCommand(String command) {
+  Future<void> sendCommand(String command) async {
     if (!bluetoothConnected || connection == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -249,11 +247,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
 
     try {
-      final Uint8List data = Uint8List.fromList(
-        utf8.encode('$command\n'),
-      );
-
-      connection!.output.add(data);
+      await connection!.output.writeLine(command);
 
       _addEvent('Command sent: $command');
     } catch (error) {
@@ -683,7 +677,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.08),
+            color: Colors.black.withValues(alpha: 0.08),
             blurRadius: 12,
             offset: const Offset(0, 5),
           ),
