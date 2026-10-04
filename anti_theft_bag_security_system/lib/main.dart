@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_classic_bluetooth/flutter_classic_bluetooth.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   runApp(const SmartBagApp());
@@ -50,6 +52,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int battery = 86;
   String motionStatus = 'Normal';
   double sensitivity = 50;
+
+  bool gpsConnected = false;
+  double? latitude;
+  double? longitude;
+  String? latestAlert;
 
   final List<String> events = [
     'System initialized',
@@ -318,6 +325,34 @@ class _DashboardScreenState extends State<DashboardScreen> {
       });
 
       _addEvent('Motion detected');
+      _triggerTheftAlert('Motion detected! Possible bag movement.');
+      return;
+    }
+
+    // ESP message format: GPS:latitude,longitude
+    if (message.startsWith('GPS:')) {
+      final coordinates = message.substring(4).split(',');
+      if (coordinates.length == 2) {
+        final lat = double.tryParse(coordinates[0].trim());
+        final lon = double.tryParse(coordinates[1].trim());
+
+        if (lat != null && lon != null) {
+          setState(() {
+            latitude = lat;
+            longitude = lon;
+            gpsConnected = true;
+          });
+          _addEvent('GPS location updated');
+        }
+      }
+      return;
+    }
+
+    if (message == 'GPS_OFF' || message == 'GPS_ERROR') {
+      setState(() {
+        gpsConnected = false;
+      });
+      _addEvent('GPS unavailable');
       return;
     }
 
@@ -328,6 +363,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         setState(() {
           motionStatus = 'Alert';
         });
+        _triggerTheftAlert('Zipper opened! Possible tampering detected.');
       }
 
       return;
@@ -367,6 +403,63 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
 
     _addEvent('ESP32: $message');
+  }
+
+  Future<void> _triggerTheftAlert(String message) async {
+    if (!mounted) return;
+
+    await SystemSound.play(SystemSoundType.alert);
+
+    setState(() {
+      latestAlert = message;
+    });
+
+    if (!mounted) return;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.red),
+            SizedBox(width: 8),
+            Text('THEFT ALERT'),
+          ],
+        ),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> openBagLocation() async {
+    if (latitude == null || longitude == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('GPS location is not available yet.'),
+        ),
+      );
+      return;
+    }
+
+    final uri = Uri.parse(
+      'https://www.google.com/maps/search/?api=1&query=$latitude,$longitude',
+    );
+
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not open the map.'),
+        ),
+      );
+    }
   }
 
   void _handleConnectionClosed() {
@@ -623,6 +716,106 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 ),
               ),
+
+              const SizedBox(height: 12),
+
+              Row(
+                children: [
+                  Expanded(
+                    child: _infoCard(
+                      icon: Icons.gps_fixed,
+                      title: 'GPS',
+                      value: gpsConnected ? 'Connected' : 'Waiting',
+                      iconColor:
+                          gpsConnected ? Colors.green : Colors.orange,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _infoCard(
+                      icon: Icons.warning_amber_rounded,
+                      title: 'Security',
+                      value: latestAlert == null ? 'Normal' : 'Alert',
+                      iconColor:
+                          latestAlert == null ? Colors.green : Colors.red,
+                    ),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 12),
+
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.location_on, color: Colors.red),
+                        SizedBox(width: 8),
+                        Text(
+                          'Bag Location',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    if (latitude != null && longitude != null) ...[
+                      Text('Latitude: ${latitude!.toStringAsFixed(6)}'),
+                      Text('Longitude: ${longitude!.toStringAsFixed(6)}'),
+                      const SizedBox(height: 10),
+                      OutlinedButton.icon(
+                        onPressed: openBagLocation,
+                        icon: const Icon(Icons.map_outlined),
+                        label: const Text('OPEN IN MAP'),
+                      ),
+                    ] else
+                      const Text(
+                        'Waiting for GPS coordinates from the bag...',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                  ],
+                ),
+              ),
+
+              if (latestAlert != null) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: Colors.red.withValues(alpha: 0.3),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.warning_amber_rounded,
+                        color: Colors.red,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          latestAlert!,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
 
               const SizedBox(height: 24),
 
